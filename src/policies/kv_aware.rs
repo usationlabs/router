@@ -1534,7 +1534,7 @@ impl KvAwarePolicy {
                 "KV prefix decision"
             );
             let transfer = self.transfer_planner.as_deref().and_then(|planner| {
-                self.shadow_transfer_plan(
+                self.plan_transfer_for_pick(
                     planner,
                     workers,
                     &plan,
@@ -1610,11 +1610,13 @@ impl KvAwarePolicy {
         Some(PeerFetchGrant { endpoint, permit })
     }
 
-    /// Ask the planner what a peer fetch would have looked like for the picked
+    /// Ask the planner whether a peer fetch is worth it for the picked
     /// position. Pure computation over the selection snapshot (the caller holds
-    /// `selection_lock`); records the outcome and never touches routing.
+    /// `selection_lock`); records the outcome and never touches routing. In
+    /// shadow mode the plan is only reported; in active mode the caller turns it
+    /// into a fetch grant.
     #[allow(clippy::too_many_arguments)]
-    fn shadow_transfer_plan(
+    fn plan_transfer_for_pick(
         &self,
         planner: &dyn TransferPlanner,
         workers: &[Arc<dyn Worker>],
@@ -1685,13 +1687,13 @@ impl KvAwarePolicy {
                     source = %transfer.source.instance_id,
                     destination = %transfer.destination.instance_id,
                     credited_tokens = transfer.credited_tokens,
-                    "KV transfer plan (shadow)"
+                    "KV transfer plan"
                 );
                 Some(transfer)
             }
             Err(skip) => {
                 crate::metrics::RouterMetrics::record_kv_transfer_plan(skip.label());
-                tracing::debug!(skip = skip.label(), "KV transfer plan skipped (shadow)");
+                tracing::debug!(skip = skip.label(), "KV transfer plan skipped");
                 None
             }
         }
