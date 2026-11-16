@@ -477,7 +477,7 @@ pub struct CostDecision {
 
 /// Result of an admitted KV-aware selection. Worker load is already reserved;
 /// the router owns its release together with the optional request slot.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct KvSelectionReceipt {
     pub worker_index: usize,
     pub new_prefill_tokens: u64,

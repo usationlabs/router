@@ -146,11 +146,9 @@ impl PeerFetchLimiter {
             }
         }
         Some(PeerFetchPermit {
-            inner: Arc::new(PermitInner {
-                limiter: self.clone(),
-                source,
-                released: AtomicBool::new(false),
-            }),
+            limiter: self.clone(),
+            source,
+            released: AtomicBool::new(false),
         })
     }
 
@@ -170,44 +168,33 @@ impl PeerFetchLimiter {
     }
 }
 
+/// One in-flight slot against a source. It has a single owner and is freed by
+/// [`release`](Self::release) or when it drops, whichever is first.
 #[derive(Debug)]
-struct PermitInner {
+pub struct PeerFetchPermit {
     limiter: Arc<PeerFetchLimiter>,
     source: Arc<str>,
     released: AtomicBool,
 }
 
-impl PermitInner {
-    fn release(&self) {
+impl PeerFetchPermit {
+    /// Free the slot now. Idempotent.
+    pub fn release(&self) {
         if !self.released.swap(true, Ordering::AcqRel) {
             self.limiter.release(&self.source);
         }
     }
 }
 
-impl Drop for PermitInner {
+impl Drop for PeerFetchPermit {
     fn drop(&mut self) {
         self.release();
     }
 }
 
-/// One in-flight slot against a source. Clones share the slot; it is freed by
-/// [`release`](Self::release) or when the last clone drops, whichever is first.
-#[derive(Debug, Clone)]
-pub struct PeerFetchPermit {
-    inner: Arc<PermitInner>,
-}
-
-impl PeerFetchPermit {
-    /// Free the slot now. Idempotent.
-    pub fn release(&self) {
-        self.inner.release();
-    }
-}
-
 /// Active mode's decision for one planned request: where the destination
 /// should fetch from, and the in-flight slot that fetch holds.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PeerFetchGrant {
     pub endpoint: PeerEndpoint,
     pub permit: PeerFetchPermit,
@@ -1630,17 +1617,6 @@ mod tests {
         assert!(limiter.inflight.is_empty(), "idle sources are forgotten");
         // `first` was released explicitly; dropping it must not free again.
         drop(first);
-        assert_eq!(limiter.inflight("a"), 0);
-    }
-
-    #[test]
-    fn permit_clones_share_one_slot() {
-        let limiter = PeerFetchLimiter::new(1);
-        let permit = limiter.try_acquire("a").unwrap();
-        let clone = permit.clone();
-        drop(permit);
-        assert_eq!(limiter.inflight("a"), 1, "a clone still holds it");
-        drop(clone);
         assert_eq!(limiter.inflight("a"), 0);
     }
 
