@@ -713,7 +713,7 @@ impl ConfigValidator {
 
     /// Validate compatibility between different configuration sections
     fn validate_compatibility(config: &RouterConfig) -> ConfigResult<()> {
-        // Shadow transfer planning runs only in the colocated kv_aware
+        // Transfer planning runs only in the colocated kv_aware
         // selector. PD picks its prefill and decode workers through
         // pd_router::select_stage, which never calls the planner, so a PD
         // config with a planner would accept the setting and record nothing.

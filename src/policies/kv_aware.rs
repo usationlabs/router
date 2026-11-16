@@ -483,10 +483,10 @@ pub struct KvSelectionReceipt {
     pub new_prefill_tokens: u64,
     pub decision: CostDecision,
     pub slot: Option<KvRequestSlot>,
-    /// Shadow-mode transfer plan: what fetching the prefix from a busier peer
-    /// would have looked like. Reported only; routing and the slot charge are
-    /// unaffected. `None` when no planner is configured or no plan was made.
-    // Only unit tests inspect the shadow plan; production code reports it
+    /// Transfer plan for this request, if the planner made one. Routing and
+    /// the slot charge are unaffected. `None` when no planner is configured or
+    /// no plan was made.
+    // Only unit tests inspect the plan; production code reports it
     // through logs/metrics at planning time and does not read it back.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) transfer: Option<TransferPlan>,
@@ -984,12 +984,12 @@ pub struct KvAwarePolicy {
     selection_lock: Mutex<()>,
     /// Every registration gets a new generation, including load-only targets.
     next_generation: AtomicU64,
-    /// Opt-in shadow-mode transfer planner; `None` leaves selection untouched.
+    /// Opt-in transfer planner; `None` leaves selection untouched.
     transfer_planner: Option<Arc<dyn TransferPlanner>>,
     /// Declared transfer capabilities, keyed by worker URL.
     transfer_capabilities: DashMap<String, TransferCapability>,
     /// Peer fetch addresses reported by engines, keyed by worker URL. A
-    /// capability without an entry here is shadow-only.
+    /// capability without an entry here can be planned but not fetched.
     peer_endpoints: DashMap<String, PeerEndpoint>,
     /// Workers whose `transfer_capabilities` entry came from an engine record
     /// rather than static config. Only these are removed when re-discovery
@@ -1108,7 +1108,7 @@ impl KvAwarePolicy {
             .map_or(0, |state| state.limiter.inflight(source_url))
     }
 
-    /// Enable shadow-mode transfer planning. Plans are attached to receipts
+    /// Enable transfer planning. Plans are attached to receipts
     /// but never change routing.
     pub(crate) fn with_transfer_planner(mut self, planner: Arc<dyn TransferPlanner>) -> Self {
         self.transfer_planner = Some(planner);
@@ -1184,8 +1184,8 @@ impl KvAwarePolicy {
     }
 
     /// Where `worker_url` accepts peer KV fetches, if its engine reported a
-    /// valid record. A capability without an address is shadow-only; active
-    /// mode must require this on the source.
+    /// valid record. A capability without an address can be planned but not
+    /// fetched; active mode requires this on the source.
     pub fn peer_endpoint(&self, worker_url: &str) -> Option<PeerEndpoint> {
         self.peer_endpoints
             .get(worker_url)
@@ -4434,7 +4434,7 @@ mod tests {
             .collect()
     }
 
-    // Shadow-mode transfer planning ------------------------------------
+    // Transfer planning ------------------------------------
 
     struct FixedLoad(HashMap<RoutableTarget, LoadSample>);
     impl LoadProvider for FixedLoad {
@@ -4456,7 +4456,7 @@ mod tests {
             min_prefix_blocks: 4,
             require_capability: false,
             transfer_fixed_ms: 0.0,
-            ..Default::default()
+            ..crate::config::types::KvTransferConfig::default().transfer_policy()
         }
     }
 
@@ -4564,7 +4564,7 @@ mod tests {
         assert_eq!(receipt.worker_index, expected.worker_index);
         assert_eq!(receipt.new_prefill_tokens, expected.new_prefill_tokens);
         assert_eq!(receipt.decision, expected.decision);
-        let plan = receipt.transfer.as_ref().expect("shadow plan");
+        let plan = receipt.transfer.as_ref().expect("plan");
         assert_eq!(plan.source, targets[0]);
         assert_eq!(plan.destination, targets[1]);
         assert_eq!(plan.blocks, (0, 16));
@@ -4733,7 +4733,7 @@ mod tests {
 
         assert!(!policy.set_peer_fetch_enabled(false));
         let receipt = select(&policy, &workers);
-        assert!(receipt.transfer.is_some(), "shadow planning continues");
+        assert!(receipt.transfer.is_some(), "planning continues");
         assert!(receipt.peer_fetch.is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
 

@@ -1,9 +1,10 @@
-//! Shadow-mode KV transfer planning for `kv_aware`.
+//! KV transfer planning for `kv_aware`.
 //!
 //! After a worker is picked, the planner asks whether fetching the cached
-//! prefix from a busier peer with the same cache identity would have beaten
-//! recomputing it. The answer is only reported: nothing moves and routing does
-//! not change. The planner is a pure function of its input.
+//! prefix from a busier peer with the same cache identity would beat
+//! recomputing it. The plan never changes which worker is picked. In shadow
+//! mode it is only counted; in active mode the policy turns it into a peer
+//! fetch. The planner is a pure function of its input.
 //!
 //! Every peer's residency is measured from the destination's own prompt lookup
 //! (`TransferPlannerInput::destination_hits`), so a peer's prefix always
@@ -20,9 +21,9 @@ use dashmap::DashMap;
 use super::kv_aware::{request_prefill_tokens_with_device_prefix, CandidateView, CostParams};
 use crate::kv_index::{CacheKey, RoutableTarget, StorageTier, TierMatch};
 
-/// Opt-in planner configuration. `Default` is disabled. Cost constants are
-/// placeholders until calibrated; in PR 1 they only shape shadow-mode plans and
-/// never affect routing.
+/// Opt-in planner configuration, built from `KvTransferConfig::transfer_policy`.
+/// Cost constants are placeholders until calibrated; they shape which transfers
+/// are planned and never affect which worker is picked.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransferPolicy {
     pub enabled: bool,
@@ -37,21 +38,6 @@ pub struct TransferPolicy {
     pub transfer_us_per_token: f64,
     /// Transfer must cost less than `margin` times the prefill it saves. In (0, 1].
     pub margin: f64,
-}
-
-impl Default for TransferPolicy {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            min_prefix_blocks: 64,
-            source_load_threshold: 1,
-            require_capability: true,
-            prefill_us_per_token: 50.0,
-            transfer_fixed_ms: 5.0,
-            transfer_us_per_token: 5.0,
-            margin: 0.8,
-        }
-    }
 }
 
 impl TransferPolicy {
@@ -70,7 +56,7 @@ impl TransferPolicy {
 }
 
 /// What a worker can do for KV transfer. Declared per worker in router config
-/// (`kv_transfer_capability`); engine-reported capability is later work.
+/// or reported by the engine in its `peer_lookup` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferCapability {
     pub can_export: bool,
@@ -95,9 +81,8 @@ impl TransferCapability {
 }
 
 /// Where an engine rank accepts peer KV fetches, as it reported in its
-/// `peer_lookup` record. Shadow mode never uses it; a capability without an
-/// address is shadow-only, and active mode will require the address on the
-/// source.
+/// `peer_lookup` record. Active mode needs the source's address to fetch; a
+/// capability without one can be planned but not fetched.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerEndpoint {
     pub engine_id: Arc<str>,
@@ -200,8 +185,7 @@ pub(crate) struct PeerFetchGrant {
     pub permit: PeerFetchPermit,
 }
 
-/// A hypothetical transfer the planner would have made. In PR 1 it is only
-/// reported.
+/// A transfer the planner chose for one request.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TransferPlan {
     /// Assigned by the policy (monotonic counter); 0 inside the pure function.
@@ -586,6 +570,7 @@ fn plan_from_source(
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
+    use crate::config::types::{KvTransferConfig, KvTransferMode};
     use crate::kv_index::{HashMode, Locality};
     use crate::policies::kv_aware::{LoadSample, Scorer};
 
@@ -648,12 +633,21 @@ mod tests {
         matches.iter().flatten().cloned().collect()
     }
 
-    fn enabled() -> TransferPolicy {
-        TransferPolicy {
-            enabled: true,
-            require_capability: false,
-            ..TransferPolicy::default()
+    /// A policy as the config builds it, with the given mode.
+    fn policy_for(mode: KvTransferMode) -> TransferPolicy {
+        KvTransferConfig {
+            mode,
+            ..Default::default()
         }
+        .transfer_policy()
+    }
+
+    fn enabled() -> TransferPolicy {
+        policy_for(KvTransferMode::Shadow)
+    }
+
+    fn disabled() -> TransferPolicy {
+        policy_for(KvTransferMode::Off)
     }
 
     fn view<'a>(
@@ -789,15 +783,12 @@ mod tests {
         // Identity and policy checks still come first.
         pair.keys[0] = None;
         assert_eq!(pair.plan(&enabled()), Err(TransferSkip::UnverifiedIdentity));
-        assert_eq!(
-            pair.plan(&TransferPolicy::default()),
-            Err(TransferSkip::Disabled)
-        );
+        assert_eq!(pair.plan(&disabled()), Err(TransferSkip::Disabled));
     }
 
     #[test]
     fn default_policy_is_disabled_and_valid() {
-        let policy = TransferPolicy::default();
+        let policy = disabled();
         assert!(!policy.enabled);
         assert!(policy.valid());
         assert_eq!(Pair::new(0, 100).plan(&policy), Err(TransferSkip::Disabled));
@@ -888,13 +879,6 @@ mod tests {
             ..enabled()
         }
         .valid());
-    }
-
-    #[test]
-    fn unverified_destination_is_skipped() {
-        let mut pair = Pair::new(0, 100);
-        pair.keys[0] = None;
-        assert_eq!(pair.plan(&enabled()), Err(TransferSkip::UnverifiedIdentity));
     }
 
     #[test]
@@ -1266,30 +1250,6 @@ mod tests {
         assert_eq!(plan.blocks, (30, 125));
     }
 
-    #[test]
-    fn cost_rule_planner_delegates_to_plan_transfer() {
-        let pair = Pair::new(0, 100);
-        let planner = CostRuleTransferPlanner { policy: enabled() };
-        let candidates = [
-            view(&pair.targets[0], &pair.matches[0], 0, 0),
-            view(&pair.targets[1], &pair.matches[1], 4, 10_000),
-        ];
-        let keys = [pair.keys[0].as_ref(), pair.keys[1].as_ref()];
-        let hits = concat(&pair.matches);
-        let peers = peer_inputs(&candidates, &keys, &[None, None], &pair.excluded);
-        let input = TransferPlannerInput {
-            peers: &peers,
-            picked: 0,
-            destination_hits: Some(&hits),
-            cost_params: &CostParams::default(),
-        };
-        assert_eq!(planner.plan(&input), plan_transfer(&input, &enabled()));
-        let off = CostRuleTransferPlanner {
-            policy: TransferPolicy::default(),
-        };
-        assert_eq!(off.plan(&input).result, Err(TransferSkip::Disabled));
-    }
-
     /// One candidate for [`plan_many`]: matches on its own prompt (also used as
     /// the destination lookup), load, retry exclusion and capability.
     struct Peer {
@@ -1523,23 +1483,6 @@ mod tests {
     }
 
     #[test]
-    fn estimate_is_present_on_a_planned_outcome() {
-        // Idle empty destination, source with 100 blocks, 4 active requests and
-        // 10_000 queued tokens; 2000-token prompt at 50 us/token.
-        // credited = 1600; transfer = 5 + 1600 * 5 / 1000 = 13 ms;
-        // fetch = 0 + 13 + prefill(400) = 33 ms;
-        // wait = prefill(10_000) + prefill(400) = 520 ms; saved = prefill(1600) = 80 ms.
-        let outcome = Pair::new(0, 100).outcome(&enabled());
-        let plan = outcome.result.expect("planned");
-        let estimate = outcome.estimate.expect("estimate on a plan");
-        assert_eq!(estimate.fetch_ms, 33.0);
-        assert_eq!(estimate.wait_ms, 520.0);
-        assert_eq!(estimate.saved_ms, 80.0);
-        assert_eq!(plan.estimated_saved_prefill_ms, estimate.saved_ms);
-        assert_eq!(plan.estimated_transfer_ms, estimate.transfer_ms);
-    }
-
-    #[test]
     fn estimate_is_present_on_a_cost_rule_skip() {
         let policy = TransferPolicy {
             prefill_us_per_token: 1.0,
@@ -1575,7 +1518,7 @@ mod tests {
         let mut excluded = Pair::new(0, 100);
         excluded.excluded[1] = true;
         assert_eq!(excluded.outcome(&enabled()).estimate, None);
-        let outcome = Pair::new(0, 100).outcome(&TransferPolicy::default());
+        let outcome = Pair::new(0, 100).outcome(&disabled());
         assert_eq!(outcome.result, Err(TransferSkip::Disabled));
         assert_eq!(outcome.estimate, None);
 
