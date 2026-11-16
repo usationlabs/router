@@ -17,8 +17,8 @@ use std::sync::Arc;
 use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 
-use super::kv_aware::{request_prefill_tokens, CandidateView, CostParams};
-use crate::kv_index::{CacheKey, Locality, RoutableTarget, StorageTier, TierMatch};
+use super::kv_aware::{request_prefill_tokens_with_device_prefix, CandidateView, CostParams};
+use crate::kv_index::{CacheKey, RoutableTarget, StorageTier, TierMatch};
 
 /// Opt-in planner configuration. `Default` is disabled. Cost constants are
 /// placeholders until calibrated; in PR 1 they only shape shadow-mode plans and
@@ -445,14 +445,18 @@ pub(crate) fn plan_transfer(
 
 /// Remaining prefill for `candidate` under the router's own cost model (the
 /// same tier credits and last-token rule that scored it), in tokens.
+///
+/// `extra_device_prefix` counts device blocks `[0, n)` on top of the
+/// candidate's matches (0 = none), so "after a fetch" needs no copy of them.
 fn routing_prefill_tokens(
     candidate: &CandidateView<'_>,
     cost_params: &CostParams,
     block_size: u32,
+    extra_device_prefix: u32,
 ) -> u64 {
     let mut params = *cost_params;
     params.block_size = block_size;
-    request_prefill_tokens(candidate, &params)
+    request_prefill_tokens_with_device_prefix(candidate, &params, extra_device_prefix)
 }
 
 /// The two paths the planner compares, in milliseconds, plus what the fetch
@@ -491,20 +495,10 @@ fn estimate_costs(
 
     // After the fetch the destination holds `[0, fetched_end)` on device, on
     // top of whatever else it already had.
-    let mut fetched_matches = destination.matches.to_vec();
-    fetched_matches.push(TierMatch {
-        target: destination.target.clone(),
-        tier: StorageTier::Device,
-        segments: vec![(0, fetched_end)],
-        locality: Locality::Local,
-    });
-    let after_fetch = CandidateView {
-        matches: &fetched_matches,
-        ..*destination
-    };
-    let rem_dest_before = routing_prefill_tokens(destination, input.cost_params, block_size);
-    let rem_dest_after = routing_prefill_tokens(&after_fetch, input.cost_params, block_size);
-    let rem_src = routing_prefill_tokens(source, input.cost_params, block_size);
+    let rem_dest_before = routing_prefill_tokens(destination, input.cost_params, block_size, 0);
+    let rem_dest_after =
+        routing_prefill_tokens(destination, input.cost_params, block_size, fetched_end);
+    let rem_src = routing_prefill_tokens(source, input.cost_params, block_size, 0);
 
     CostEstimate {
         transfer_ms,
@@ -592,7 +586,7 @@ fn plan_from_source(
 #[cfg(all(test, feature = "cpu", feature = "ready"))]
 mod tests {
     use super::*;
-    use crate::kv_index::HashMode;
+    use crate::kv_index::{HashMode, Locality};
     use crate::policies::kv_aware::{LoadSample, Scorer};
 
     fn target(name: &str) -> RoutableTarget {

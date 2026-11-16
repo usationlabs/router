@@ -735,7 +735,14 @@ pub trait Picker: Send + Sync + std::fmt::Debug {
 /// Device prefix plus one external continuation, matching vLLM's two-segment
 /// reuse rule. The return value is in tokens and can be fractional because a
 /// transfer penalty is a credit ratio.
-fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
+///
+/// `extra_device_prefix` is a device prefix `[0, n)` counted on top of the
+/// candidate's own matches without materializing a match for it (0 = none).
+fn credited_tokens(
+    candidate: &CandidateView<'_>,
+    params: &CostParams,
+    extra_device_prefix: u32,
+) -> f64 {
     let device_blocks = candidate
         .matches
         .iter()
@@ -745,6 +752,7 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
         .map(|(_, end)| end)
         .max()
         .unwrap_or(0)
+        .max(extra_device_prefix)
         // vLLM must recompute the last prompt token to obtain logits. Local
         // GPU prefix reuse is block-aligned, so never credit its final block
         // when that block ends at the prompt boundary.
@@ -785,12 +793,24 @@ fn credited_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> f64 {
 }
 
 pub(super) fn request_prefill_tokens(candidate: &CandidateView<'_>, params: &CostParams) -> u64 {
+    request_prefill_tokens_with_device_prefix(candidate, params, 0)
+}
+
+/// [`request_prefill_tokens`] as if the candidate also held device blocks
+/// `[0, extra_device_prefix)`.
+pub(super) fn request_prefill_tokens_with_device_prefix(
+    candidate: &CandidateView<'_>,
+    params: &CostParams,
+    extra_device_prefix: u32,
+) -> u64 {
     if let Some(tokens) = candidate.prefill_tokens {
         return tokens;
     }
     // Round remaining work up: a fractional transfer credit never erases a
     // whole token of compute that was not fully credited.
-    ((candidate.input_tokens as f64 - credited_tokens(candidate, params)).max(0.0)).ceil() as u64
+    ((candidate.input_tokens as f64 - credited_tokens(candidate, params, extra_device_prefix))
+        .max(0.0))
+    .ceil() as u64
 }
 
 pub fn cost_components(candidate: &CandidateView<'_>, params: &CostParams) -> CostComponents {
@@ -1540,6 +1560,28 @@ impl KvAwarePolicy {
                 used_binding,
                 "KV prefix decision"
             );
+            // Reserve the actual target's slot and worker load before unlocking.
+            // This is all the routing state the selection changes, so it is the
+            // only work that must stay serialized with the pick above.
+            let slot = self.slot_manager.as_ref().map(|manager| {
+                manager.begin_prefill(&target, new_prefill_tokens);
+                KvRequestSlot::new(manager.clone(), target, new_prefill_tokens, record.take())
+            });
+            // No slot guard will run; release the reference inline.
+            if slot.is_none() {
+                if let Some(record) = record {
+                    record.release_ref();
+                }
+            }
+            if let Some(worker) = workers.get(worker_index) {
+                worker.increment_load();
+            }
+            drop(guard);
+            // Planning and the grant read only the snapshot (`plan`,
+            // `candidates`) plus self-synchronized state (`DashMap`s, the
+            // limiter, an atomic id), so they run outside the lock. If the
+            // source unregisters in between, the grant finds no endpoint and
+            // the request goes out unchanged.
             let transfer = self.transfer_planner.as_deref().and_then(|planner| {
                 self.plan_transfer_for_pick(
                     planner,
@@ -1554,20 +1596,6 @@ impl KvAwarePolicy {
             let peer_fetch = transfer
                 .as_ref()
                 .and_then(|transfer| self.peer_fetch_grant(workers, &plan, transfer));
-            // Reserve the actual target's slot and worker load before unlocking.
-            let slot = self.slot_manager.as_ref().map(|manager| {
-                manager.begin_prefill(&target, new_prefill_tokens);
-                KvRequestSlot::new(manager.clone(), target, new_prefill_tokens, record.take())
-            });
-            // No slot guard will run; release the reference inline.
-            if slot.is_none() {
-                if let Some(record) = record {
-                    record.release_ref();
-                }
-            }
-            if let Some(worker) = workers.get(worker_index) {
-                worker.increment_load();
-            }
             return Some(KvSelectionReceipt {
                 worker_index,
                 new_prefill_tokens,
@@ -1582,7 +1610,9 @@ impl KvAwarePolicy {
 
     /// Active mode: turn a plan into a fetch address and an in-flight slot.
     /// `None` (counted) when the source has no reported address or is at the
-    /// cap; `None` (not counted) in shadow mode. Caller holds `selection_lock`.
+    /// cap; `None` (not counted) in shadow mode. Does not need `selection_lock`: it
+    /// reads the selection snapshot, `peer_endpoints` and the limiter, which
+    /// synchronize themselves.
     fn peer_fetch_grant(
         &self,
         workers: &[Arc<dyn Worker>],
@@ -1626,7 +1656,7 @@ impl KvAwarePolicy {
     }
 
     /// Ask the planner whether a peer fetch is worth it for the picked
-    /// position. Pure computation over the selection snapshot (the caller holds
+    /// position. Pure computation over the selection snapshot (needs no
     /// `selection_lock`); records the outcome and never touches routing. In
     /// shadow mode the plan is only reported; in active mode the caller turns it
     /// into a fetch grant.
@@ -1647,14 +1677,16 @@ impl KvAwarePolicy {
             // Also covers the load-only fallback attempt.
             TransferOutcome::skip(TransferSkip::MissingTokens)
         } else {
-            let capabilities: Vec<Option<TransferCapability>> = plan
+            // Hold the map refs for the call instead of cloning each
+            // capability. DashMap shard locks admit new readers while a writer
+            // waits, so taking several refs cannot deadlock; a concurrent
+            // register or unregister just waits until planning returns.
+            let capabilities: Vec<
+                Option<dashmap::mapref::one::Ref<'_, String, TransferCapability>>,
+            > = plan
                 .healthy
                 .iter()
-                .map(|&index| {
-                    self.transfer_capabilities
-                        .get(workers[index].url())
-                        .map(|entry| entry.value().clone())
-                })
+                .map(|&index| self.transfer_capabilities.get(workers[index].url()))
                 .collect();
             let peers: Vec<PeerInput<'_>> = candidates
                 .iter()
@@ -1662,7 +1694,7 @@ impl KvAwarePolicy {
                 .map(|(i, candidate)| PeerInput {
                     candidate,
                     cache_key: plan.bindings[i].cache_key.as_ref(),
-                    capability: capabilities[i].as_ref(),
+                    capability: capabilities[i].as_deref(),
                     excluded: excluded(i),
                 })
                 .collect();
@@ -2774,7 +2806,7 @@ mod tests {
                 input_tokens: tokens,
             };
             assert_eq!(
-                credited_tokens(&candidate, &params),
+                credited_tokens(&candidate, &params, 0),
                 cached as f64,
                 "tokens={tokens}"
             );
@@ -4619,6 +4651,40 @@ mod tests {
         let receipt = select(&policy, &workers);
         assert!(receipt.transfer.is_some());
         assert!(receipt.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+    }
+
+    /// Selection plans outside the lock, so the source can unregister between
+    /// the snapshot and the grant. Driving that interleaving deterministically
+    /// is impractical, so this calls the grant directly on a plan made earlier,
+    /// after the source was unregistered: no grant, no limiter slot.
+    #[test]
+    fn grant_without_a_source_endpoint_takes_no_slot() {
+        let (policy, workers, _) = active_fixture(4);
+        let ids = transfer_ids();
+        let first = select(&policy, &workers);
+        let transfer = first.transfer.clone().expect("plan");
+        assert!(first.peer_fetch.is_some());
+        drop(first);
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
+
+        let plan = policy
+            .prepare_selection(
+                &workers,
+                QualifiedKvInput {
+                    tokens: KvRequestTokens::Shared(Some(&ids)),
+                    eligibility: None,
+                },
+                None,
+                None,
+            )
+            .expect("snapshot");
+        // The source goes away after the snapshot was taken.
+        policy.unregister_target("http://a");
+
+        assert!(policy
+            .peer_fetch_grant(&workers, &plan, &transfer)
+            .is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
     }
 
