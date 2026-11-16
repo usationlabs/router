@@ -1098,8 +1098,9 @@ impl KvAwarePolicy {
         self.transfer_planner.is_some()
     }
 
-    /// Declare what a worker can do for KV transfer. Replaced on re-register
-    /// and dropped by `unregister_target`.
+    /// Declare what a worker can do for KV transfer. Replaced on re-register.
+    /// Survives `unregister_target`: only engine-reported capabilities are
+    /// dropped when a worker is removed.
     pub fn register_transfer_capability(
         &self,
         worker_url: impl Into<String>,
@@ -1217,8 +1218,11 @@ impl KvAwarePolicy {
 
     pub fn unregister_target(&self, worker_url: &str) {
         let _guard = self.selection_lock.lock();
-        self.transfer_capabilities.remove(worker_url);
-        self.engine_capabilities.remove(worker_url);
+        // Static capabilities are operator config and outlive the worker; only
+        // an engine-reported one is dropped with it.
+        if self.engine_capabilities.remove(worker_url).is_some() {
+            self.transfer_capabilities.remove(worker_url);
+        }
         self.peer_endpoints.remove(worker_url);
         if let Some((_, binding)) = self.targets.remove(worker_url) {
             if let Some(slot_manager) = &self.slot_manager {
@@ -4824,9 +4828,51 @@ mod tests {
         assert!(receipt.transfer.is_none());
         release_receipt(&workers, &receipt);
 
+        // Static capabilities are operator config and survive unregister.
+        policy.unregister_target("http://a");
+        assert!(policy.transfer_capabilities.get("http://a").is_some());
+        assert!(policy.transfer_capabilities.get("http://b").is_some());
+    }
+
+    #[test]
+    fn static_capability_survives_unregister_and_reregister() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
+        policy.register_transfer_capability("http://a", capability("static"));
+
+        policy.unregister_target("http://a");
+        assert_eq!(
+            &*policy
+                .transfer_capabilities
+                .get("http://a")
+                .unwrap()
+                .layout_fingerprint,
+            "static"
+        );
+
+        KvAwareOps::register_worker(&policy, worker.as_ref(), None, None);
+        assert!(policy.transfer_capabilities.get("http://a").is_some());
+        assert!(policy.engine_capabilities.is_empty());
+    }
+
+    #[test]
+    fn engine_capability_is_removed_on_unregister() {
+        let policy = KvAwarePolicy::default();
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorker::new("http://a".into(), WorkerType::Regular));
+        KvAwareOps::register_worker(
+            &policy,
+            worker.as_ref(),
+            Some(&peer_info(&[(0, peer_record("engine", 5600))])),
+            None,
+        );
+        assert!(policy.transfer_capabilities.get("http://a").is_some());
+
         policy.unregister_target("http://a");
         assert!(policy.transfer_capabilities.get("http://a").is_none());
-        assert!(policy.transfer_capabilities.get("http://b").is_some());
+        assert!(policy.engine_capabilities.is_empty());
     }
 
     #[test]
