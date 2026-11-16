@@ -114,7 +114,7 @@ pub struct PeerEndpoint {
 /// permit is released or dropped, so a request that errors out, is cancelled or
 /// is dropped mid-stream cannot leak a slot.
 #[derive(Debug)]
-pub struct PeerFetchLimiter {
+pub(crate) struct PeerFetchLimiter {
     max_inflight: usize,
     /// In-flight fetches by source worker URL; zero entries are removed.
     inflight: DashMap<Arc<str>, usize>,
@@ -171,7 +171,7 @@ impl PeerFetchLimiter {
 /// One in-flight slot against a source. It has a single owner and is freed by
 /// [`release`](Self::release) or when it drops, whichever is first.
 #[derive(Debug)]
-pub struct PeerFetchPermit {
+pub(crate) struct PeerFetchPermit {
     limiter: Arc<PeerFetchLimiter>,
     source: Arc<str>,
     released: AtomicBool,
@@ -195,7 +195,7 @@ impl Drop for PeerFetchPermit {
 /// Active mode's decision for one planned request: where the destination
 /// should fetch from, and the in-flight slot that fetch holds.
 #[derive(Debug)]
-pub struct PeerFetchGrant {
+pub(crate) struct PeerFetchGrant {
     pub endpoint: PeerEndpoint,
     pub permit: PeerFetchPermit,
 }
@@ -203,7 +203,7 @@ pub struct PeerFetchGrant {
 /// A hypothetical transfer the planner would have made. In PR 1 it is only
 /// reported.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TransferPlan {
+pub(crate) struct TransferPlan {
     /// Assigned by the policy (monotonic counter); 0 inside the pure function.
     pub plan_id: u64,
     pub source: RoutableTarget,
@@ -221,7 +221,7 @@ pub struct TransferPlan {
 
 /// Why no plan was made. `label()` is a stable string for metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransferSkip {
+pub(crate) enum TransferSkip {
     Disabled,
     /// The picked position is outside the peer list: a caller bug.
     MisalignedInput,
@@ -265,7 +265,7 @@ impl TransferSkip {
 }
 
 /// One routing candidate as the planner sees it.
-pub struct PeerInput<'a> {
+pub(crate) struct PeerInput<'a> {
     pub candidate: &'a CandidateView<'a>,
     /// `None` when the worker's cache identity is unknown. The block size is
     /// read from here.
@@ -276,7 +276,7 @@ pub struct PeerInput<'a> {
 }
 
 /// Everything the planner may read.
-pub struct TransferPlannerInput<'a> {
+pub(crate) struct TransferPlannerInput<'a> {
     pub peers: &'a [PeerInput<'a>],
     /// Index into `peers` of the destination.
     pub picked: usize,
@@ -295,7 +295,7 @@ pub struct TransferPlannerInput<'a> {
 /// planned peer, or the peer whose `CostRule` skip is reported). `None` for
 /// skips that happen before the cost rule.
 #[derive(Debug, Clone, PartialEq)]
-pub struct TransferOutcome {
+pub(crate) struct TransferOutcome {
     pub result: Result<TransferPlan, TransferSkip>,
     pub estimate: Option<CostEstimate>,
 }
@@ -309,12 +309,12 @@ impl TransferOutcome {
     }
 }
 
-pub trait TransferPlanner: Send + Sync + std::fmt::Debug {
+pub(crate) trait TransferPlanner: Send + Sync + std::fmt::Debug {
     fn plan(&self, input: &TransferPlannerInput<'_>) -> TransferOutcome;
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct CostRuleTransferPlanner {
+pub(crate) struct CostRuleTransferPlanner {
     pub policy: TransferPolicy,
 }
 
@@ -356,7 +356,10 @@ fn prefix_blocks<'a>(matches: impl Iterator<Item = &'a TierMatch> + Clone) -> u3
 }
 
 /// Pure: no locks, no I/O, no clock. Deterministic for the same input.
-pub fn plan_transfer(input: &TransferPlannerInput<'_>, policy: &TransferPolicy) -> TransferOutcome {
+pub(crate) fn plan_transfer(
+    input: &TransferPlannerInput<'_>,
+    policy: &TransferPolicy,
+) -> TransferOutcome {
     if !policy.enabled || !policy.valid() {
         return TransferOutcome::skip(TransferSkip::Disabled);
     }
@@ -456,7 +459,7 @@ fn routing_prefill_tokens(
 /// saves. Both paths price the remaining prefill with the router's estimate
 /// so a plan never disagrees with the cost model that made the pick.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CostEstimate {
+pub(crate) struct CostEstimate {
     pub transfer_ms: f64,
     /// Destination queue + transfer + destination prefill after the fetch.
     pub fetch_ms: f64,

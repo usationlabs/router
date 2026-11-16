@@ -486,12 +486,15 @@ pub struct KvSelectionReceipt {
     /// Shadow-mode transfer plan: what fetching the prefix from a busier peer
     /// would have looked like. Reported only; routing and the slot charge are
     /// unaffected. `None` when no planner is configured or no plan was made.
-    pub transfer: Option<TransferPlan>,
+    // Only unit tests inspect the shadow plan; production code reports it
+    // through logs/metrics at planning time and does not read it back.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) transfer: Option<TransferPlan>,
     /// Active mode only: where the destination should fetch `transfer` from,
     /// with the source's in-flight slot. `None` in shadow mode, when there is
     /// no plan, or when the plan could not be acted on (no source address, or
     /// the source is at its in-flight cap).
-    pub peer_fetch: Option<PeerFetchGrant>,
+    pub(crate) peer_fetch: Option<PeerFetchGrant>,
 }
 
 /// Fixed bound of the affinity table shared by every policy instance.
@@ -1087,7 +1090,7 @@ impl KvAwarePolicy {
 
     /// Enable shadow-mode transfer planning. Plans are attached to receipts
     /// but never change routing.
-    pub fn with_transfer_planner(mut self, planner: Arc<dyn TransferPlanner>) -> Self {
+    pub(crate) fn with_transfer_planner(mut self, planner: Arc<dyn TransferPlanner>) -> Self {
         self.transfer_planner = Some(planner);
         self
     }
