@@ -741,6 +741,29 @@ impl ConfigValidator {
                 });
             }
         }
+        // Active mode adds fetch params in the HTTP send path only; a gRPC
+        // worker never gets them, so reject the combination up front.
+        let active = |policy: &PolicyConfig| {
+            matches!(
+                policy,
+                PolicyConfig::KvAware { kv_transfer: Some(kv_transfer), .. }
+                    if kv_transfer.mode == KvTransferMode::Active
+            )
+        };
+        if active(&config.policy) {
+            let has_grpc_url = match &config.mode {
+                RoutingMode::Regular { worker_urls } => worker_urls
+                    .iter()
+                    .any(|url| crate::backend::is_grpc_url(url)),
+                _ => false,
+            };
+            if has_grpc_url || config.connection_mode == ConnectionMode::Grpc {
+                return Err(ConfigError::IncompatibleConfig {
+                    reason: "kv_transfer.mode=active needs HTTP workers; grpc:// workers are not supported"
+                        .to_string(),
+                });
+            }
+        }
         if let Some(program) = &config.program_scheduling {
             let pd_mode = matches!(config.mode, RoutingMode::VllmPrefillDecode { .. });
             if (!matches!(config.mode, RoutingMode::Regular { .. }) && !pd_mode)
@@ -1981,5 +2004,35 @@ mod tests {
             ..Default::default()
         }))
         .unwrap();
+    }
+
+    #[test]
+    fn test_kv_transfer_active_rejects_grpc_workers() {
+        let active = || KvTransferConfig {
+            mode: KvTransferMode::Active,
+            ..Default::default()
+        };
+        let mut config = kv_transfer_config(active());
+        config.mode = RoutingMode::Regular {
+            worker_urls: vec!["grpc://a:50051".to_string(), "grpc://b:50051".to_string()],
+        };
+        let error = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(error.contains("needs HTTP workers"), "{error}");
+
+        let mut config = kv_transfer_config(active());
+        config.connection_mode = ConnectionMode::Grpc;
+        let error = ConfigValidator::validate(&config).unwrap_err().to_string();
+        assert!(error.contains("needs HTTP workers"), "{error}");
+
+        // Shadow with gRPC workers and active with HTTP workers stay accepted.
+        let mut shadow = kv_transfer_config(KvTransferConfig {
+            mode: KvTransferMode::Shadow,
+            ..Default::default()
+        });
+        shadow.mode = RoutingMode::Regular {
+            worker_urls: vec!["grpc://b:50051".to_string()],
+        };
+        ConfigValidator::validate(&shadow).unwrap();
+        ConfigValidator::validate(&kv_transfer_config(active())).unwrap();
     }
 }

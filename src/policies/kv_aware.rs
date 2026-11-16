@@ -1590,15 +1590,23 @@ impl KvAwarePolicy {
             .peer_fetch
             .as_ref()
             .filter(|state| state.enabled.load(Ordering::Acquire))?;
+        // The HTTP send path cannot add fetch params for a gRPC destination,
+        // so a slot taken here would be held for nothing.
+        let worker_url_for = |target: &RoutableTarget| {
+            plan.bindings
+                .iter()
+                .position(|binding| &binding.target == target)
+                .and_then(|position| plan.healthy.get(position))
+                .and_then(|&index| workers.get(index))
+                .map(|worker| worker.url())
+        };
+        if worker_url_for(&transfer.destination).is_some_and(crate::backend::is_grpc_url) {
+            crate::metrics::RouterMetrics::record_kv_transfer_request("grpc_destination");
+            return None;
+        }
         // The plan names its source by target; peer addresses are keyed by
         // worker URL, so go through the same snapshot the plan was made from.
-        let source_url = plan
-            .bindings
-            .iter()
-            .position(|binding| binding.target == transfer.source)
-            .and_then(|position| plan.healthy.get(position))
-            .and_then(|&index| workers.get(index))
-            .map(|worker| worker.url());
+        let source_url = worker_url_for(&transfer.source);
         let Some((source_url, endpoint)) = source_url.and_then(|url| {
             self.peer_endpoints
                 .get(url)
@@ -4439,7 +4447,14 @@ mod tests {
     fn transfer_fixture(
         planner: bool,
     ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
-        let workers: Vec<Arc<dyn Worker>> = ["http://a", "http://b"]
+        transfer_fixture_with_urls(planner, ["http://a", "http://b"])
+    }
+
+    fn transfer_fixture_with_urls(
+        planner: bool,
+        urls: [&str; 2],
+    ) -> (KvAwarePolicy, Vec<Arc<dyn Worker>>, Vec<RoutableTarget>) {
+        let workers: Vec<Arc<dyn Worker>> = urls
             .iter()
             .map(|url| {
                 Arc::new(BasicWorker::new((*url).into(), WorkerType::Regular)) as Arc<dyn Worker>
@@ -4572,6 +4587,20 @@ mod tests {
         let grant = receipt.peer_fetch.as_ref().expect("grant");
         assert_eq!(grant.endpoint, peer_endpoint("engine-a", 5600));
         assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
+    }
+
+    #[test]
+    fn grpc_destination_plans_but_takes_no_slot() {
+        let (policy, workers, _) = transfer_fixture_with_urls(true, ["http://a", "grpc://b"]);
+        let policy = policy.with_peer_fetch(4);
+        policy
+            .peer_endpoints
+            .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
+        let receipt = select(&policy, &workers);
+        assert_eq!(receipt.worker_index, 1, "grpc worker is the destination");
+        assert!(receipt.transfer.is_some());
+        assert!(receipt.peer_fetch.is_none());
+        assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
     }
 
     #[test]
