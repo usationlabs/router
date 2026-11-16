@@ -483,14 +483,7 @@ pub struct KvSelectionReceipt {
     pub new_prefill_tokens: u64,
     pub decision: CostDecision,
     pub slot: Option<KvRequestSlot>,
-    /// Transfer plan for this request, if the planner made one. Routing and
-    /// the slot charge are unaffected. `None` when no planner is configured or
-    /// no plan was made.
-    // Only unit tests inspect the plan; production code reports it
-    // through logs/metrics at planning time and does not read it back.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) transfer: Option<TransferPlan>,
-    /// Active mode only: where the destination should fetch `transfer` from,
+    /// Active mode only: where the destination should fetch the transfer from,
     /// with the source's in-flight slot. `None` in shadow mode, when there is
     /// no plan, or when the plan could not be acted on (no source address, or
     /// the source is at its in-flight cap).
@@ -982,6 +975,9 @@ pub struct KvAwarePolicy {
     affinity: Arc<KvAffinityTable>,
     /// Serializes load sampling, selection, and reservation.
     selection_lock: Mutex<()>,
+    /// Test-only: the plan of the latest successful selection.
+    #[cfg(test)]
+    last_transfer_plan: Mutex<Option<TransferPlan>>,
     /// Every registration gets a new generation, including load-only targets.
     next_generation: AtomicU64,
     /// Opt-in transfer planner; `None` leaves selection untouched.
@@ -1057,6 +1053,8 @@ impl KvAwarePolicy {
             decode_tie_cursor: AtomicU64::new(0),
             affinity: Arc::new(KvAffinityTable::new()),
             selection_lock: Mutex::new(()),
+            #[cfg(test)]
+            last_transfer_plan: Mutex::new(None),
             next_generation: AtomicU64::new(1),
             transfer_planner: None,
             transfer_capabilities: DashMap::new(),
@@ -1593,6 +1591,10 @@ impl KvAwarePolicy {
                     &excluded,
                 )
             });
+            #[cfg(test)]
+            {
+                *self.last_transfer_plan.lock() = transfer.clone();
+            }
             let peer_fetch = transfer
                 .as_ref()
                 .and_then(|transfer| self.peer_fetch_grant(workers, &plan, transfer));
@@ -1601,7 +1603,6 @@ impl KvAwarePolicy {
                 new_prefill_tokens,
                 decision,
                 slot,
-                transfer,
                 peer_fetch,
             });
         }
@@ -2393,6 +2394,14 @@ impl KvAwareOps for KvAwarePolicy {
         for url in removed {
             self.unregister_target(&url);
         }
+    }
+}
+
+#[cfg(test)]
+impl KvAwarePolicy {
+    /// Plan of the latest successful selection (`None` when none was made).
+    fn last_transfer_plan(&self) -> Option<TransferPlan> {
+        self.last_transfer_plan.lock().clone()
     }
 }
 
@@ -4545,7 +4554,7 @@ mod tests {
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
         assert_eq!(receipt.worker_index, 1);
-        assert!(receipt.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
     }
 
     #[test]
@@ -4564,17 +4573,17 @@ mod tests {
         assert_eq!(receipt.worker_index, expected.worker_index);
         assert_eq!(receipt.new_prefill_tokens, expected.new_prefill_tokens);
         assert_eq!(receipt.decision, expected.decision);
-        let plan = receipt.transfer.as_ref().expect("plan");
+        let plan = policy.last_transfer_plan().expect("plan");
         assert_eq!(plan.source, targets[0]);
         assert_eq!(plan.destination, targets[1]);
         assert_eq!(plan.blocks, (0, 16));
         assert_eq!(plan.credited_tokens, 32);
         assert_eq!(plan.plan_id, 1);
         release_receipt(&workers, &receipt);
-        let again = policy
+        let _again = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
-        assert_eq!(again.transfer.unwrap().plan_id, 2);
+        assert_eq!(policy.last_transfer_plan().unwrap().plan_id, 2);
     }
 
     fn peer_endpoint(engine_id: &str, port: u16) -> PeerEndpoint {
@@ -4611,7 +4620,7 @@ mod tests {
     fn active_mode_grants_the_sources_address_for_a_plan() {
         let (policy, workers, _) = active_fixture(4);
         let receipt = select(&policy, &workers);
-        assert!(receipt.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         let grant = receipt.peer_fetch.as_ref().expect("grant");
         assert_eq!(grant.endpoint, peer_endpoint("engine-a", 5600));
         assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
@@ -4626,7 +4635,7 @@ mod tests {
             .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
         let receipt = select(&policy, &workers);
         assert_eq!(receipt.worker_index, 1, "grpc worker is the destination");
-        assert!(receipt.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         assert!(receipt.peer_fetch.is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
     }
@@ -4638,7 +4647,7 @@ mod tests {
             .peer_endpoints
             .insert("http://a".to_owned(), peer_endpoint("engine-a", 5600));
         let receipt = select(&policy, &workers);
-        assert!(receipt.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         assert!(receipt.peer_fetch.is_none());
         assert!(!policy.peer_fetch_enabled());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
@@ -4649,7 +4658,7 @@ mod tests {
         let (policy, workers, _) = active_fixture(4);
         policy.peer_endpoints.remove("http://a");
         let receipt = select(&policy, &workers);
-        assert!(receipt.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         assert!(receipt.peer_fetch.is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
     }
@@ -4663,7 +4672,7 @@ mod tests {
         let (policy, workers, _) = active_fixture(4);
         let ids = transfer_ids();
         let first = select(&policy, &workers);
-        let transfer = first.transfer.clone().expect("plan");
+        let transfer = policy.last_transfer_plan().expect("plan");
         assert!(first.peer_fetch.is_some());
         drop(first);
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
@@ -4716,7 +4725,7 @@ mod tests {
 
         // Over the cap: still planned, but no grant.
         let second = select(&policy, &workers);
-        assert!(second.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         assert!(second.peer_fetch.is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 1);
 
@@ -4733,7 +4742,7 @@ mod tests {
 
         assert!(!policy.set_peer_fetch_enabled(false));
         let receipt = select(&policy, &workers);
-        assert!(receipt.transfer.is_some(), "planning continues");
+        assert!(policy.last_transfer_plan().is_some(), "planning continues");
         assert!(receipt.peer_fetch.is_none());
         assert_eq!(policy.peer_fetch_inflight("http://a"), 0);
 
@@ -4829,7 +4838,11 @@ mod tests {
     fn per_worker_transfer(
         a_prompt: Vec<u32>,
         b_prompt: Option<Vec<u32>>,
-    ) -> (KvSelectionReceipt, Vec<RoutableTarget>) {
+    ) -> (
+        KvSelectionReceipt,
+        Vec<RoutableTarget>,
+        Option<TransferPlan>,
+    ) {
         let (policy, workers, targets) = per_worker_transfer_fixture(&a_prompt);
         let mut inputs = WorkerTokenInputs::new();
         inputs.insert(workers[0].base_url().into(), Arc::from(vec![a_prompt]));
@@ -4846,36 +4859,36 @@ mod tests {
                 &[],
             )
             .unwrap();
-        (receipt, targets)
+        (receipt, targets, policy.last_transfer_plan())
     }
 
     #[test]
     fn per_worker_plan_credits_only_the_shared_part_of_the_destination_prompt() {
         // `a` caches its whole 20-block prompt; `b`'s prompt shares 6 blocks.
-        let (receipt, targets) = per_worker_transfer(transfer_ids(), Some(diverging_ids(12)));
+        let (receipt, targets, plan) = per_worker_transfer(transfer_ids(), Some(diverging_ids(12)));
         assert_eq!(receipt.worker_index, 1);
-        let plan = receipt.transfer.as_ref().expect("shared part is planned");
+        let plan = plan.expect("shared part is planned");
         assert_eq!(plan.source, targets[0]);
         assert_eq!(plan.destination, targets[1]);
         assert_eq!(plan.blocks, (0, 6));
         assert_eq!(plan.credited_tokens, 12);
 
         // Only 3 shared blocks: below `min_prefix_blocks`, so no plan.
-        let (receipt, _) = per_worker_transfer(transfer_ids(), Some(diverging_ids(6)));
+        let (receipt, _, plan) = per_worker_transfer(transfer_ids(), Some(diverging_ids(6)));
         assert_eq!(receipt.worker_index, 1);
-        assert!(receipt.transfer.is_none());
+        assert!(plan.is_none());
 
         // Fully disjoint prompts: nothing to fetch.
-        let (receipt, _) = per_worker_transfer(transfer_ids(), Some(diverging_ids(0)));
+        let (receipt, _, plan) = per_worker_transfer(transfer_ids(), Some(diverging_ids(0)));
         assert_eq!(receipt.worker_index, 1);
-        assert!(receipt.transfer.is_none());
+        assert!(plan.is_none());
     }
 
     #[test]
     fn per_worker_identical_prompts_plan_like_shared_tokens() {
-        let (receipt, targets) = per_worker_transfer(transfer_ids(), Some(transfer_ids()));
+        let (receipt, targets, plan) = per_worker_transfer(transfer_ids(), Some(transfer_ids()));
         assert_eq!(receipt.worker_index, 1);
-        let plan = receipt.transfer.as_ref().expect("plan");
+        let plan = plan.expect("plan");
         assert_eq!(plan.source, targets[0]);
         assert_eq!(plan.blocks, (0, 20));
         assert_eq!(plan.credited_tokens, 39);
@@ -4883,9 +4896,9 @@ mod tests {
 
     #[test]
     fn per_worker_destination_without_a_prompt_gets_no_plan() {
-        let (receipt, _) = per_worker_transfer(transfer_ids(), None);
+        let (receipt, _, plan) = per_worker_transfer(transfer_ids(), None);
         assert_eq!(receipt.worker_index, 1);
-        assert!(receipt.transfer.is_none());
+        assert!(plan.is_none());
     }
 
     #[test]
@@ -4901,7 +4914,7 @@ mod tests {
         let receipt = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
-        assert!(receipt.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
         release_receipt(&workers, &receipt);
 
         policy.register_transfer_capability("http://a", capability("x"));
@@ -4909,14 +4922,14 @@ mod tests {
         let receipt = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
-        assert!(receipt.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         release_receipt(&workers, &receipt);
 
         policy.register_transfer_capability("http://b", capability("y"));
         let receipt = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, None, &[])
             .unwrap();
-        assert!(receipt.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
         release_receipt(&workers, &receipt);
 
         // Static capabilities are operator config and survive unregister.
@@ -4974,19 +4987,19 @@ mod tests {
         let first = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, Some(&key), &[])
             .unwrap();
-        assert!(first.transfer.is_some());
+        assert!(policy.last_transfer_plan().is_some());
         release_receipt(&workers, &first);
         let second = policy
             .select_worker_with_receipt(&workers, Some(&ids), None, None, Some(&key), &[])
             .unwrap();
         assert_eq!(second.worker_index, first.worker_index);
-        assert!(second.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
         release_receipt(&workers, &second);
 
         let load_only = policy
             .select_worker_with_receipt(&workers, None, None, None, None, &[])
             .unwrap();
-        assert!(load_only.transfer.is_none());
+        assert!(policy.last_transfer_plan().is_none());
         release_receipt(&workers, &load_only);
     }
 
@@ -5091,7 +5104,7 @@ mod tests {
                     receipt.worker_index,
                     receipt.new_prefill_tokens,
                     receipt.decision.clone(),
-                    receipt.transfer.is_some(),
+                    policy.last_transfer_plan().is_some(),
                 ));
                 release_receipt(&workers, &receipt);
             }
