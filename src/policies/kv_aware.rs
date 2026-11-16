@@ -13,7 +13,7 @@ use rand::Rng;
 use sha2::{Digest as _, Sha256};
 
 use super::kv_transfer::{
-    PeerEndpoint, PeerFetchGrant, PeerFetchLimiter, TransferCapability, TransferOutcome,
+    PeerEndpoint, PeerFetchGrant, PeerFetchLimiter, PeerInput, TransferCapability, TransferOutcome,
     TransferPlan, TransferPlanner, TransferPlannerInput, TransferSkip,
 };
 use super::{get_healthy_worker_indices, LoadBalancingPolicy, RequestHeaders};
@@ -1653,25 +1653,18 @@ impl KvAwarePolicy {
                         .map(|entry| entry.value().clone())
                 })
                 .collect();
-            let capability_refs: Vec<Option<&TransferCapability>> =
-                capabilities.iter().map(Option::as_ref).collect();
-            let cache_keys: Vec<Option<&CacheKey>> = plan
-                .bindings
+            let peers: Vec<PeerInput<'_>> = candidates
                 .iter()
-                .map(|binding| binding.cache_key.as_ref())
+                .enumerate()
+                .map(|(i, candidate)| PeerInput {
+                    candidate,
+                    cache_key: plan.bindings[i].cache_key.as_ref(),
+                    capability: capabilities[i].as_ref(),
+                    excluded: excluded(i),
+                })
                 .collect();
-            let block_sizes: Vec<u32> = plan
-                .bindings
-                .iter()
-                .map(|binding| binding.block_size)
-                .collect();
-            let excluded: Vec<bool> = (0..candidates.len()).map(excluded).collect();
             planner.plan(&TransferPlannerInput {
-                candidates,
-                cache_keys: &cache_keys,
-                block_sizes: &block_sizes,
-                capabilities: &capability_refs,
-                excluded: &excluded,
+                peers: &peers,
                 picked: position,
                 destination_hits: plan.peer_hits[position].as_deref(),
                 cost_params: &self.params,

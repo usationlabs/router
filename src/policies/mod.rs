@@ -38,8 +38,8 @@ pub use kv_aware::{
 };
 pub use kv_transfer::{
     plan_transfer, CostEstimate, CostRuleTransferPlanner, PeerEndpoint, PeerFetchGrant,
-    PeerFetchLimiter, PeerFetchPermit, TransferCapability, TransferOutcome, TransferPlan,
-    TransferPlanner, TransferPlannerInput, TransferPolicy, TransferSkip,
+    PeerFetchLimiter, PeerFetchPermit, PeerInput, TransferCapability, TransferOutcome,
+    TransferPlan, TransferPlanner, TransferPlannerInput, TransferPolicy, TransferSkip,
 };
 pub use power_of_two::PowerOfTwoPolicy;
 pub use random::RandomPolicy;
