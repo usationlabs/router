@@ -596,4 +596,106 @@ mod tests {
             assert_eq!(policy.has_transfer_planner(), expect_planner);
         }
     }
+
+    fn active_block() -> crate::config::types::KvTransferConfig {
+        crate::config::types::KvTransferConfig {
+            mode: crate::config::types::KvTransferMode::Active,
+            ..Default::default()
+        }
+    }
+
+    fn kv(policy: &Arc<dyn LoadBalancingPolicy>) -> &KvAwarePolicy {
+        policy
+            .as_any()
+            .downcast_ref::<KvAwarePolicy>()
+            .expect("kv_aware policy")
+    }
+
+    #[test]
+    fn peer_fetch_flag_is_shared_by_default_and_hint_created_policies() {
+        let registry = PolicyRegistry::new(kv_aware_main(Some(active_block())));
+        let default = registry.get_default_policy();
+        let hinted = registry.on_worker_added("hinted", Some("kv_aware"));
+        assert!(!Arc::ptr_eq(&default, &hinted));
+        assert!(kv(&default).peer_fetch_enabled());
+        assert!(kv(&hinted).peer_fetch_enabled());
+
+        let status = registry.set_peer_fetch_enabled(false);
+        assert!(!status.enabled);
+        assert!(!kv(&default).peer_fetch_enabled());
+        assert!(!kv(&hinted).peer_fetch_enabled());
+        assert!(status.policies.iter().all(|policy| !policy.enabled));
+
+        // A policy's own setter stores to the same shared flag.
+        assert!(kv(&hinted).set_peer_fetch_enabled(true));
+        assert!(kv(&default).peer_fetch_enabled());
+        assert!(registry.peer_fetch_status().enabled);
+    }
+
+    #[test]
+    fn hint_created_policy_after_disable_starts_disabled() {
+        let registry = PolicyRegistry::new(kv_aware_main(Some(active_block())));
+        registry.set_peer_fetch_enabled(false);
+        let late = registry.on_worker_added("late", Some("kv_aware"));
+        assert!(kv(&late).is_peer_fetch_active_mode());
+        assert!(!kv(&late).peer_fetch_enabled());
+
+        registry.set_peer_fetch_enabled(true);
+        assert!(kv(&late).peer_fetch_enabled());
+    }
+
+    #[test]
+    fn peer_fetch_status_lists_each_active_instance_once() {
+        let registry = PolicyRegistry::new(kv_aware_main(Some(active_block())));
+        // Two models share the default instance; one has its own.
+        registry.on_worker_added("m2", None);
+        registry.on_worker_added("m1", None);
+        registry.on_worker_added("m1", None);
+        registry.on_worker_added("own", Some("kv_aware"));
+        // Not kv_aware: not listed.
+        registry.on_worker_added("rr", Some("round_robin"));
+
+        let mut status = registry.peer_fetch_status();
+        status.policies.sort_by_key(|policy| !policy.default);
+        assert_eq!(
+            status,
+            PeerFetchStatus {
+                enabled: true,
+                policies: vec![
+                    PeerFetchPolicyStatus {
+                        models: vec!["m1".into(), "m2".into()],
+                        default: true,
+                        enabled: true,
+                    },
+                    PeerFetchPolicyStatus {
+                        models: vec!["own".into()],
+                        default: false,
+                        enabled: true,
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn policies_not_built_active_are_not_listed() {
+        use crate::config::types::KvTransferMode::{Off, Shadow};
+        let block = |mode| crate::config::types::KvTransferConfig {
+            mode,
+            ..Default::default()
+        };
+        for main in [
+            kv_aware_main(Some(block(Shadow))),
+            kv_aware_main(Some(block(Off))),
+            kv_aware_main(None),
+            PolicyConfig::RoundRobin,
+        ] {
+            let registry = PolicyRegistry::new(main);
+            registry.on_worker_added("default", None);
+            registry.on_worker_added("hinted", Some("kv_aware"));
+            let status = registry.set_peer_fetch_enabled(false);
+            assert!(status.policies.is_empty(), "{status:?}");
+            assert!(!status.enabled);
+        }
+    }
 }
