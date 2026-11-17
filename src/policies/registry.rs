@@ -347,8 +347,11 @@ impl PolicyRegistry {
 
     /// [`set_peer_fetch_enabled`](Self::set_peer_fetch_enabled), but only
     /// when at least one policy is in active mode; `None` (flag unchanged)
-    /// otherwise. The check, the store and the returned status happen under
-    /// one lock, so concurrent callers are applied one after the other.
+    /// otherwise. On success it also sets the
+    /// `vllm_router_kv_transfer_peer_fetch_enabled` gauge and logs the new
+    /// state at warn. The check, the store, the status, the gauge and the
+    /// log happen under one lock, so concurrent callers are applied one after
+    /// the other and the gauge always matches the flag.
     pub fn set_peer_fetch_enabled_if_active(&self, enabled: bool) -> Option<PeerFetchStatus> {
         let _guard = self
             .peer_fetch_lock
@@ -358,7 +361,18 @@ impl PolicyRegistry {
             return None;
         }
         self.peer_fetch_enabled.store(enabled, Ordering::Release);
-        Some(self.peer_fetch_status())
+        let status = self.peer_fetch_status();
+        crate::metrics::RouterMetrics::set_kv_transfer_peer_fetch_enabled(status.enabled);
+        warn!(
+            enabled = status.enabled,
+            "KV transfer peer fetch {} for all active-mode kv_aware policies",
+            if status.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+        Some(status)
     }
 
     /// The kill switch flag and every distinct active-mode `kv_aware`

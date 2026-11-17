@@ -689,7 +689,8 @@ async fn set_peer_fetch(
         }
     };
 
-    // The active-policy check and the store are one locked step.
+    // The active-policy check, the store, the gauge and the log are one
+    // locked step in the registry.
     let registry = &state.context.policy_registry;
     let Some(status) = registry.set_peer_fetch_enabled_if_active(request.enabled) else {
         return (
@@ -1124,6 +1125,13 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.api_key_validation_urls.clone(),
     )?;
     println!("DEBUG: AppContext created");
+
+    // Export the kill switch state before any call to /kv_transfer/peer_fetch
+    // when the main policy is in active mode.
+    let peer_fetch = app_context.policy_registry.peer_fetch_status();
+    if peer_fetch.policies.iter().any(|policy| policy.default) {
+        metrics::RouterMetrics::set_kv_transfer_peer_fetch_enabled(peer_fetch.enabled);
+    }
 
     let app_context = Arc::new(app_context);
 
