@@ -635,6 +635,72 @@ async fn finish_session(
     Json(json!({ "status": "ok", "session_id": session_id })).into_response()
 }
 
+#[derive(Deserialize)]
+struct PeerFetchRequest {
+    enabled: bool,
+}
+
+/// GET /kv_transfer/peer_fetch
+///
+/// Reports the active-mode peer fetch kill switch and each active-mode
+/// `kv_aware` policy it covers. `policies` is empty when none is active.
+async fn get_peer_fetch(State(state): State<Arc<AppState>>, headers: http::HeaderMap) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    Json(state.context.policy_registry.peer_fetch_status()).into_response()
+}
+
+/// POST /kv_transfer/peer_fetch with `{"enabled": bool}`
+///
+/// Runtime kill switch for active-mode peer KV fetch. Flips every active-mode
+/// `kv_aware` policy at once; takes effect for selections after the call.
+/// The body is parsed after authorization so an unauthorized caller never
+/// learns anything from body errors. 400 on a bad body, 409 when no policy is
+/// in active mode (the flag is left unchanged).
+async fn set_peer_fetch(
+    State(state): State<Arc<AppState>>,
+    headers: http::HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if let Err(response) = authorize_request(&state, &headers).await {
+        return response;
+    }
+
+    // serde would also accept `[true]` for a struct; require an object.
+    let request = serde_json::from_slice::<serde_json::Value>(&body).and_then(|value| {
+        if value.is_object() {
+            serde_json::from_value::<PeerFetchRequest>(value)
+        } else {
+            Err(serde::de::Error::custom("the body must be a JSON object"))
+        }
+    });
+    let request = match request {
+        Ok(request) => request,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": format!("expected a JSON body {{\"enabled\": bool}}: {error}")
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // The active-policy check and the store are one locked step.
+    let registry = &state.context.policy_registry;
+    let Some(status) = registry.set_peer_fetch_enabled_if_active(request.enabled) else {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "no policy in active mode" })),
+        )
+            .into_response();
+    };
+    Json(status).into_response()
+}
+
 // ---------- Worker management endpoints (RESTful) ----------
 
 /// POST /workers - Add a new worker with full configuration
@@ -928,7 +994,11 @@ pub fn build_app_with_wasm_middleware(
         .route("/flush_cache", post(flush_cache))
         .route("/get_loads", get(get_loads))
         .route("/scheduling/diagnostics", get(scheduling_diagnostics))
-        .route("/finish_session", post(finish_session));
+        .route("/finish_session", post(finish_session))
+        .route(
+            "/kv_transfer/peer_fetch",
+            get(get_peer_fetch).post(set_peer_fetch),
+        );
 
     // Worker management routes
     let worker_routes = Router::new()
